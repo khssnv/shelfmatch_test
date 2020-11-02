@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import math
+import threading
+
+from gazebo_msgs.srv import GetModelState, GetModelStateRequest
+from geometry_msgs.msg import PoseStamped, Point, Pose, Quaternion
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from std_msgs.msg import Header
+from std_srvs.srv import Empty, EmptyResponse
+import actionlib
+import rospy
+
+
+class FakeObjectLocalization:
+    """Object localization by Gazebo simulation state queries."""
+    SHELF_LENGTH = 1.527
+    SHELF_DEPTH = 0.753
+
+    def __init__(self):
+        self.state_srv_name = "/gazebo/get_model_state"
+        rospy.loginfo("Starting fake object localization")
+        rospy.loginfo(f"Waiting for service {self.state_srv_name}")
+        rospy.wait_for_service(self.state_srv_name)
+        rospy.loginfo(f"Service {self.state_srv_name} connected")
+        self.state_srv = rospy.ServiceProxy(self.state_srv_name, GetModelState)
+        rospy.loginfo("Fake localization is ready.")
+
+    def get_shef1_corners(self):
+        """Get shelf location.
+
+        Returns
+        -------
+        Tuple[Point, Point, Point, Point]
+            First shelf corners starts from bottom-left and clockwise then.
+
+        Notes
+        -----
+        * Shelf frame sits in the middle of the long side.
+        * True values are (clockwise, starts from bottom left):
+            x: 0.8071219325065613
+            y: -2.2537267208099365
+            z: 0.002471923828125
+
+            x: 0.7869439721107483
+            y: -0.7400297522544861
+            z: -0.001434326171875
+
+            x: 1.4864498376846313
+            y: -0.726574718952179
+            z: -0.001434326171875
+
+            x: 1.5604360103607178
+            y: -2.2537267208099365
+            z: 0.002471923828125
+        """
+        state = self.state_srv(GetModelStateRequest(
+            model_name="BookshelfA_01_001"
+        ))
+        rospy.loginfo(f"Got shelf state: {state}")
+        corners = (  # clockwise, starts from bottom left
+            Point(
+                x=state.pose.position.x - self.SHELF_DEPTH,
+                y=state.pose.position.y - self.SHELF_LENGTH/2,
+                z=state.pose.position.z,
+            ),
+            Point(
+                x=state.pose.position.x - self.SHELF_DEPTH,
+                y=state.pose.position.y + self.SHELF_LENGTH/2,
+                z=state.pose.position.z,
+            ),
+            Point(
+                x=state.pose.position.x,
+                y=state.pose.position.y + self.SHELF_LENGTH/2,
+                z=state.pose.position.z,
+            ),
+            Point(
+                x=state.pose.position.x,
+                y=state.pose.position.y - self.SHELF_LENGTH/2,
+                z=state.pose.position.z,
+            ),
+        )
+        rospy.loginfo(f"Shelf corners are at points: {corners}")
+        return corners
+
+
+class ShelfScanner:
+    """Shelf scanning procedure waypoints generator and procedure executor.
+
+    Requirements
+    ------------
+    * All the procedure robot looks at the shelf with one side only.
+    * Scanning distance is 20 cm.
+    """
+
+    SCAN_DISTANCE = 0.2  # meters
+    WP_GRANULARITY = 0.3  # meters
+
+    def __init__(self):
+        rospy.init_node("shelf_scanner")
+        rospy.loginfo(f"Node {rospy.get_name()} starting...")
+        self.shelf_localization = FakeObjectLocalization()
+        self.move_ac = actionlib.SimpleActionClient("/move_base",
+                                                    MoveBaseAction)
+        rospy.Service("~start_scan", Empty, self.scan_cb)
+        self.busy_lock = threading.Lock()
+        rospy.loginfo(f"Node {rospy.get_name()} ready.")
+
+    def scan_cb(self, req):
+        if self.busy_lock.acquire(blocking=False):
+            threading.Thread(target=self.scan, daemon=True).start()
+        else:
+            rospy.logwarn("Rejecting scanning request, busy with previous.")
+        return EmptyResponse()
+
+    def scan(self):
+        """Move around a shelf.
+
+        Procedure
+        ---------
+        1. Check shelf position
+        2. Calculate waypoints
+        3. Move in between waypoints sequentially
+        """
+
+        rospy.loginfo("Starting shelf scanning...")
+
+        # 1. Check shelf position
+        shelf_corners = self.shelf_localization.get_shef1_corners()
+
+        # 2. Calculate waypoints
+        path_corners = self._expand_rect(shelf_corners, self.SCAN_DISTANCE)
+        length, depth = self._calc_len_depth(path_corners)
+        orientations = (
+            Pose(orientation=Quaternion(
+                z=0.7256277282869978,
+                w=0.6880874943937368,
+            )),
+            Pose(orientation=Quaternion(
+                z=0.006796016547295146,
+                w=0.9999769068128967,
+            )),
+            Pose(orientation=Quaternion(
+                z=-0.6426464238976994,
+                w=0.7661628898945043,
+            )),
+            Pose(orientation=Quaternion(
+                z=0.9999815148055875,
+                w=0.006080299920445638,
+            )),
+        )
+
+        waypoints = []
+
+        for i in range(math.floor(length / self.WP_GRANULARITY)):
+            next_pose = Pose(
+                position=Point(
+                    x=path_corners[0].x,
+                    y=path_corners[0].y + i * self.WP_GRANULARITY,
+                ),
+                orientation=Quaternion(
+                    z=orientations[0].orientation.z,
+                    w=orientations[0].orientation.w,
+                ),
+            )
+            waypoints.append(next_pose)
+
+        for i in range(math.floor(depth / self.WP_GRANULARITY)):
+            next_pose = Pose(
+                position=Point(
+                    x=path_corners[1].x + i * self.WP_GRANULARITY,
+                    y=path_corners[1].y + 0.1,
+                ),
+                orientation=Quaternion(
+                    z=orientations[1].orientation.z,
+                    w=orientations[1].orientation.w,
+                ),
+            )
+            waypoints.append(next_pose)
+
+        for i in range(math.floor(length / self.WP_GRANULARITY)):
+            next_pose = Pose(
+                position=Point(
+                    x=path_corners[2].x + 0.2,
+                    y=path_corners[2].y - i * self.WP_GRANULARITY,
+                ),
+                orientation=Quaternion(
+                    z=orientations[2].orientation.z,
+                    w=orientations[2].orientation.w,
+                ),
+            )
+            waypoints.append(next_pose)
+
+        for i in range(math.floor(depth / self.WP_GRANULARITY)):
+            next_pose = Pose(
+                position=Point(
+                    x=path_corners[3].x - i * self.WP_GRANULARITY,
+                    y=path_corners[3].y - 0.1,
+                ),
+                orientation=Quaternion(
+                    z=orientations[3].orientation.z,
+                    w=orientations[3].orientation.w,
+                ),
+            )
+            waypoints.append(next_pose)
+
+        # 3. Move in between waypoints sequentially
+        for idx, next_pose in enumerate(waypoints):
+            next_goal = MoveBaseGoal(
+                target_pose=PoseStamped(
+                    header=Header(frame_id="map"),
+                    pose=next_pose,
+                ),
+            )
+            self.move_ac.send_goal_and_wait(next_goal)
+            rospy.loginfo(f"Moving to waypoint {idx} of {len(waypoints)}...")
+
+        rospy.loginfo("Scanning complete.")
+
+    @classmethod
+    def _calc_len_depth(cls, corners):
+        depth = math.hypot(
+            corners[3].x - corners[0].x,
+            corners[3].y - corners[0].y,
+        )
+        length = math.hypot(
+            corners[1].x - corners[0].x,
+            corners[1].y - corners[0].y,
+        )
+        return length, depth
+
+    @classmethod
+    def _expand_rect(cls, corners, distance):
+        return (
+            Point(
+                x=corners[0].x - distance,
+                y=corners[0].y - distance,
+                z=corners[0].z,
+            ),
+            Point(
+                x=corners[1].x - distance,
+                y=corners[1].y + distance,
+                z=corners[1].z,
+            ),
+            Point(
+                x=corners[2].x + distance,
+                y=corners[2].y + distance,
+                z=corners[2].z,
+            ),
+            Point(
+                x=corners[3].x + distance,
+                y=corners[3].y - distance,
+                z=corners[3].z,
+            ),
+        )
+
+    def spin(self):
+        rospy.spin()
+
+
+if __name__ == "__main__":
+    ShelfScanner().spin()
