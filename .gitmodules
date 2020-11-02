@@ -1,0 +1,16 @@
+[submodule "src/aws-robomaker-bookstore-world"]
+	path = src/aws-robomaker-bookstore-world
+	url = https://github.com/aws-robotics/aws-robomaker-bookstore-world.git
+	branch = ros1
+[submodule "src/turtlebot3-description-reduced-mesh"]
+	path = src/turtlebot3-description-reduced-mesh
+	url = https://github.com/aws-robotics/turtlebot3-description-reduced-mesh.git
+	branch = ros1
+[submodule "src/turtlebot3"]
+	path = src/turtlebot3
+	url = https://github.com/ROBOTIS-GIT/turtlebot3.git
+	branch = noetic-devel
+[submodule "src/turtlebot3_simulations"]
+	path = src/turtlebot3_simulations
+	url = https://github.com/ROBOTIS-GIT/turtlebot3_simulations.git
+	branch = noetic-devel
